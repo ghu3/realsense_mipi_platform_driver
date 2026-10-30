@@ -1,0 +1,16 @@
+--- a/drivers/media/platform/tegra/camera/vi/channel.c
++++ b/drivers/media/platform/tegra/camera/vi/channel.c
+@@ -963,8 +963,12 @@
+ 		tegra_camera_update_clknbw(chan, false);
+ 	}
+ 
+-	if (ret == 0)
++	/* Stop has torn down CSI and clocks even if the sensor was unreachable.
++	 * Do not let a stale streaming flag suppress the next real start. */
++	if (!on || ret == 0)
+ 		atomic_set(&chan->is_streaming, on);
++	if (!on && ret)
++		dev_warn(chan->vi->dev, "stream stop completed with subdevice error: %d\n", ret);
+ 	return ret;
+ 
+ rollback_start:

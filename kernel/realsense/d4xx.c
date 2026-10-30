@@ -5807,6 +5807,42 @@ static void ds5_flush_idle_link(struct ds5 *state)
 }
 #endif
 
+/* Stream-off owns host SerDes cleanup even when FW stopped independently
+ * (transport handover/reset), or can no longer acknowledge the stop. */
+static int ds5_stop_serdes(struct ds5 *state, struct ds5_sensor *sensor, u16 vc_id)
+{
+	int ret = 0;
+#ifdef CONFIG_VIDEO_D4XX_SERDES
+	int err;
+
+	if (sensor->pipe_id < 0)
+		return 0;
+	mutex_lock(&serdes_lock__);
+	ret = state->dser_ops->release_pipe(state->dser_dev, sensor->pipe_id);
+	if (ret < 0)
+		dev_warn(&state->client->dev, "release pipe %d failed: %d\n",
+			 sensor->pipe_id, ret);
+	else
+		sensor->pipe_id = PIPE_NOT_CONFIGURED;
+	if (state->is_y8 &&
+	    state->ir.sensor.config.format->data_type == GMSL_CSI_DT_RGB_888)
+		state->dser_ops->reset_oneshot(state->dser_dev);
+	mutex_unlock(&serdes_lock__);
+
+	if (state->ser_ops->stream_stop) {
+		err = state->ser_ops->stream_stop(state->ser_dev,
+					       vc_id % DS5_MAX_STREAMS);
+		if (err < 0)
+			dev_warn(&state->client->dev, "serializer stream %u stop failed: %d\n",
+				 vc_id, err);
+		if (!ret)
+			ret = err;
+	}
+	msleep_range(100);
+#endif
+	return ret;
+}
+
 static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 {
 	struct ds5 *state = container_of(sd, struct ds5, mux.sd.subdev);
@@ -5837,9 +5873,6 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 		state->reset_ref_ds5 = cur_ds5;
 	}
 
-	// spare duplicate calls
-	if (sensor->streaming == on)
-		return 0;
 	if (state->is_depth) {
 		config_status_base = DS5_DEPTH_CONFIG_STATUS;
 		stream_status_base = DS5_DEPTH_STREAM_STATUS;
@@ -5872,6 +5905,10 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 	vc_id = state->g_ctx.dst_vc;
 #endif
 #endif
+	/* A FW reset may clear streaming before host pipe cleanup runs. */
+	if (sensor->streaming == on)
+		return on ? 0 : ds5_stop_serdes(state, sensor, vc_id);
+
 	dev_dbg(&state->client->dev, "s_stream for stream %s, vc:%d, SENSOR=%s on = %d\n",
 			sensor->sd.name, vc_id, ds5_get_sensor_name(state), on);
 
@@ -5945,7 +5982,7 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 			if (on && state->dser_ops->retrigger_datapath)
 				state->dser_ops->retrigger_datapath(state->dser_dev);
 #endif
-			return 0;
+			return on ? 0 : ds5_stop_serdes(state, sensor, vc_id);
 		}
 	}
 
@@ -6060,6 +6097,9 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 		}
 		ret = -EAGAIN;
 restore_streaming:
+		/* STREAMOFF still ends host ownership if FW cannot acknowledge. */
+		if (!on)
+			restore_val = false;
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 		if (on && sensor->pipe_id >= 0) {
 			int cleanup_ret;
@@ -6082,30 +6122,13 @@ restore_streaming:
 		mutex_unlock(&state->ds5_dev->lock);
 		sensor->streaming = restore_val;
 	}
-	else if (!on)
-	{
-#ifdef CONFIG_VIDEO_D4XX_SERDES
-		mutex_lock(&serdes_lock__);
-		if (state->dser_ops->release_pipe(state->dser_dev, sensor->pipe_id) < 0)
-			dev_warn(&state->client->dev, "release pipe failed\n");
-		else
-			sensor->pipe_id = PIPE_NOT_CONFIGURED;
-		if (state->is_y8
-			&& (state->ir.sensor.config.format->data_type == GMSL_CSI_DT_RGB_888))
-		{
-			state->dser_ops->reset_oneshot(state->dser_dev);
-		}
-		mutex_unlock(&serdes_lock__);
-		/* Tell the serializer this stream stopped. On the last stream it
-		 * re-arms the MIPI RX PHY (idle) so the next stream re-locks
-		 * cleanly instead of wedging the shared pipe. vc_id % DS5_MAX_STREAMS
-		 * matches the ser_vc_id passed to set_pipe in ds5_setup_pipeline(). */
-		if (state->ser_ops->stream_stop)
-			state->ser_ops->stream_stop(state->ser_dev,
-						    vc_id % DS5_MAX_STREAMS);
-		msleep_range(100);
-#endif
+	if (!on) {
+		int cleanup_ret = ds5_stop_serdes(state, sensor, vc_id);
+
+		if (!ret)
+			ret = cleanup_ret;
 	}
+
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 	if (on && ret >= 0 && state->dser_ops->retrigger_datapath)
 		state->dser_ops->retrigger_datapath(state->dser_dev);
