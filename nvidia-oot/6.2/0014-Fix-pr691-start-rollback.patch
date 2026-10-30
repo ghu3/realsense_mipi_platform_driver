@@ -1,0 +1,35 @@
+--- a/drivers/media/platform/tegra/camera/vi/channel.c
++++ b/drivers/media/platform/tegra/camera/vi/channel.c
+@@ -922,8 +922,10 @@
+ 
+ 				trace_tegra_channel_set_stream(sd->name, on);
+ 				err = v4l2_subdev_call(sd, video, s_stream, on);
+-				if (!ret && err < 0 && err != -ENOIOCTLCMD)
++				if (err < 0 && err != -ENOIOCTLCMD) {
+ 					ret = err;
++					goto rollback_start;
++				}
+ 			}
+ 			if (!chan->bypass && !chan->pg_mode &&
+ 					chan->deskew_ctx->deskew_lanes) {
+@@ -963,6 +965,20 @@
+ 
+ 	if (ret == 0)
+ 		atomic_set(&chan->is_streaming, on);
++	return ret;
++
++rollback_start:
++	/* Stop every invoked subdevice, including a partially started sensor. */
++	for (; num_sd >= 0; num_sd--) {
++		sd = chan->subdev[num_sd];
++		trace_tegra_channel_set_stream(sd->name, false);
++		err = v4l2_subdev_call(sd, video, s_stream, false);
++		if (err < 0 && err != -ENOIOCTLCMD)
++			dev_warn(chan->vi->dev, "%s stream rollback failed: %d\n",
++				 sd->name, err);
++	}
++	spec_bar();
++	tegra_camera_update_clknbw(chan, false);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(tegra_channel_set_stream);
